@@ -1,6 +1,7 @@
 import express, { Application, Request, Response, NextFunction } from 'express';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
+import path from 'path';
 import { requestIdMiddleware } from '../shared/middleware/requestId.js';
 import { requestLoggerMiddleware } from '../shared/middleware/requestLogger.js';
 import {
@@ -23,12 +24,17 @@ import { expenseRoutes, saleRoutes } from '../modules/expenses-sales/finance.rou
 import { reportRoutes } from '../modules/reports/report.routes.js';
 import { aiAdvisorRoutes } from '../modules/ai-advisor/aiAdvisor.routes.js';
 import { healthRoutes } from '../modules/health/health.routes.js';
+import { uploadRoutes } from '../modules/uploads/upload.routes.js';
 
 export function createApp(): Application {
   const app: Application = express();
 
   // Trust reverse proxies (Nginx / Cloudflare / Ingress)
   app.set('trust proxy', 1);
+
+  // Static uploads directory
+  const uploadsStaticPath = path.resolve(process.cwd(), 'public', 'uploads');
+  app.use('/uploads', express.static(uploadsStaticPath));
 
   // Security headers & CORS
   app.use(helmetMiddleware);
@@ -41,9 +47,9 @@ export function createApp(): Application {
   app.use(requestIdMiddleware);
   app.use(requestLoggerMiddleware);
 
-  // Body parsers with defensive size limits
-  app.use(express.json({ limit: '2mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+  // Body parsers with support for image base64 uploads
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
   app.use(cookieParser());
 
   // Input Sanitization (NoSQL injection, XSS, HPP)
@@ -68,6 +74,8 @@ export function createApp(): Application {
   app.use(`${API_V1}/sales`, saleRoutes);
   app.use(`${API_V1}/reports`, reportRoutes);
   app.use(`${API_V1}/ai-advisor`, aiAdvisorRoutes);
+  app.use(`${API_V1}/uploads`, uploadRoutes);
+  app.use(`${API_V1}/image-uploads`, uploadRoutes);
 
   // Direct Frontend Aliases (/api/*) for zero-configuration compatibility
   app.use('/api/animals', animalRoutes);
@@ -77,6 +85,8 @@ export function createApp(): Application {
   app.use('/api/reports', reportRoutes);
   app.use('/api/ai-advisor', aiAdvisorRoutes);
   app.use('/api/auth', authRoutes);
+  app.use('/api/uploads', uploadRoutes);
+  app.use('/api/image-uploads', uploadRoutes);
 
   // 404 Route Handler
   app.use('*', (req: Request, _res: Response, next: NextFunction) => {
