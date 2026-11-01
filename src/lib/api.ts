@@ -1,22 +1,272 @@
-import axios from 'axios';
+import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 import { Animal, MilkRecord, Expense, Sale, FarmSettings, DashboardStats } from './types';
 import { farmStore } from './store';
 
-// Base Axios instance
+// Storage keys
+const TOKEN_KEY = 'dairymitra_access_token';
+const REFRESH_TOKEN_KEY = 'dairymitra_refresh_token';
+const USER_KEY = 'dairymitra_auth_user';
+
+// Generate lightweight cryptographically random UUID v4 for Request ID and Idempotency
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+// Token helper methods
+export const tokenStorage = {
+  getAccessToken: (): string | null => {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(TOKEN_KEY);
+  },
+  setTokens: (accessToken: string, refreshToken?: string): void => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(TOKEN_KEY, accessToken);
+    if (refreshToken) localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+  },
+  getRefreshToken: (): string | null => {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(REFRESH_TOKEN_KEY);
+  },
+  clearTokens: (): void => {
+    if (typeof window === 'undefined') return;
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+  },
+  getUser: (): any | null => {
+    if (typeof window === 'undefined') return null;
+    const raw = localStorage.getItem(USER_KEY);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  },
+  setUser: (user: any): void => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(USER_KEY, JSON.stringify(user));
+  },
+};
+
+// Base Production-Grade Axios Client
 export const apiClient = axios.create({
-  baseURL: '/api',
+  baseURL: process.env.NEXT_PUBLIC_API_URL || '/api/v1',
   headers: {
     'Content-Type': 'application/json',
+    'X-Requested-With': 'XMLHttpRequest', // CSRF guard
   },
-  timeout: 10000,
+  timeout: 15000,
+  withCredentials: true,
 });
 
-// Resilient API services with local fallback
+// Request Interceptor: Attach JWT Token, Request-ID & Idempotency Key
+apiClient.interceptors.request.use(
+  (config: InternalAxiosRequestConfig) => {
+    // Attach trace Request ID
+    config.headers['X-Request-Id'] = generateUUID();
+
+    // Attach JWT Access Token if present
+    const token = tokenStorage.getAccessToken();
+    if (token && !config.headers['Authorization']) {
+      config.headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    // Attach Idempotency Key for mutating requests
+    const method = (config.method || '').toUpperCase();
+    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+      if (!config.headers['Idempotency-Key']) {
+        config.headers['Idempotency-Key'] = generateUUID();
+      }
+    }
+
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// Concurrency lock and queue for transparent 401 token refresh
+let isRefreshing = false;
+let failedQueue: Array<{
+  resolve: (value?: unknown) => void;
+  reject: (reason?: any) => void;
+}> = [];
+
+const processQueue = (error: any, token: string | null = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+// Response Interceptor: Double-Token Rotation on 401 Unauthorized
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
+
+    // If 401 Unauthorized and not already retrying
+    if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
+      const refreshToken = tokenStorage.getRefreshToken();
+
+      // If no refresh token is available, clear session
+      if (!refreshToken || originalRequest.url?.includes('/auth/login') || originalRequest.url?.includes('/auth/refresh-token')) {
+        tokenStorage.clearTokens();
+        return Promise.reject(error);
+      }
+
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        })
+          .then((token) => {
+            if (originalRequest.headers) {
+              originalRequest.headers['Authorization'] = `Bearer ${token}`;
+            }
+            return apiClient(originalRequest);
+          })
+          .catch((err) => Promise.reject(err));
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        const refreshResponse = await axios.post('/api/v1/auth/refresh-token', {
+          refreshToken,
+        });
+
+        const newAccessToken = refreshResponse.data?.data?.accessToken || refreshResponse.data?.accessToken;
+        if (newAccessToken) {
+          tokenStorage.setTokens(newAccessToken);
+          if (originalRequest.headers) {
+            originalRequest.headers['Authorization'] = `Bearer ${newAccessToken}`;
+          }
+          processQueue(null, newAccessToken);
+          return apiClient(originalRequest);
+        } else {
+          tokenStorage.clearTokens();
+          processQueue(new Error('Refresh token invalid'));
+          return Promise.reject(error);
+        }
+      } catch (refreshErr) {
+        tokenStorage.clearTokens();
+        processQueue(refreshErr, null);
+        return Promise.reject(refreshErr);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+// ----------------------------------------------------
+// Authentication API
+// ----------------------------------------------------
+export const authApi = {
+  login: async (email: string, password: string) => {
+    const res = await apiClient.post('/auth/login', { email, password });
+    const payload = res.data?.data || res.data;
+    if (payload?.accessToken) {
+      tokenStorage.setTokens(payload.accessToken, payload.refreshToken);
+      if (payload.user) {
+        tokenStorage.setUser(payload.user);
+      }
+    }
+    return payload;
+  },
+
+  signup: async (data: { name: string; email: string; password: string; farmName?: string; phone?: string }) => {
+    const res = await apiClient.post('/auth/signup', data);
+    return res.data?.data || res.data;
+  },
+
+  verifyOtp: async (email: string, otp: string) => {
+    const res = await apiClient.post('/auth/verify-otp', { email, otp });
+    const payload = res.data?.data || res.data;
+    if (payload?.accessToken) {
+      tokenStorage.setTokens(payload.accessToken, payload.refreshToken);
+      if (payload.user) {
+        tokenStorage.setUser(payload.user);
+      }
+    }
+    return payload;
+  },
+
+  me: async () => {
+    try {
+      const res = await apiClient.get('/auth/me');
+      const user = res.data?.data || res.data;
+      tokenStorage.setUser(user);
+      return user;
+    } catch {
+      return tokenStorage.getUser();
+    }
+  },
+
+  logout: () => {
+    tokenStorage.clearTokens();
+  },
+};
+
+// ----------------------------------------------------
+// Image & Receipt Upload API
+// ----------------------------------------------------
+export const uploadApi = {
+  /**
+   * Upload an image file or base64 data string to /api/uploads/image
+   */
+  uploadImage: async (fileOrBase64: File | string, category: 'cattle' | 'receipt' | 'profile' = 'cattle'): Promise<{ url: string; filename: string }> => {
+    let base64String = '';
+
+    if (typeof fileOrBase64 === 'string') {
+      base64String = fileOrBase64;
+    } else {
+      base64String = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = (err) => reject(err);
+        reader.readAsDataURL(fileOrBase64);
+      });
+    }
+
+    const res = await apiClient.post('/uploads/image', {
+      image: base64String,
+      category,
+    });
+
+    const data = res.data?.data || res.data;
+    return {
+      url: data.url,
+      filename: data.filename,
+    };
+  },
+};
+
+// ----------------------------------------------------
+// Animals / Livestock API
+// ----------------------------------------------------
 export const animalsApi = {
   getAll: async (): Promise<Animal[]> => {
     try {
-      const res = await apiClient.get<Animal[]>('/animals');
-      return res.data;
+      const res = await apiClient.get('/animals?limit=100');
+      const data = res.data?.data || res.data;
+      if (Array.isArray(data)) return data;
+      if (Array.isArray(data?.items)) return data.items;
+      return farmStore.getAnimals();
     } catch {
       return farmStore.getAnimals();
     }
@@ -24,8 +274,8 @@ export const animalsApi = {
 
   getById: async (id: string): Promise<Animal | undefined> => {
     try {
-      const res = await apiClient.get<Animal>(`/animals/${id}`);
-      return res.data;
+      const res = await apiClient.get(`/animals/${id}`);
+      return (res.data?.data || res.data) as Animal;
     } catch {
       return farmStore.getAnimalById(id);
     }
@@ -33,9 +283,10 @@ export const animalsApi = {
 
   create: async (animal: Animal): Promise<Animal> => {
     try {
-      const res = await apiClient.post<Animal>('/animals', animal);
-      farmStore.saveAnimal(res.data);
-      return res.data;
+      const res = await apiClient.post('/animals', animal);
+      const created = (res.data?.data || res.data) as Animal;
+      farmStore.saveAnimal(created);
+      return created;
     } catch {
       farmStore.saveAnimal(animal);
       return animal;
@@ -44,9 +295,10 @@ export const animalsApi = {
 
   update: async (animal: Animal): Promise<Animal> => {
     try {
-      const res = await apiClient.put<Animal>(`/animals/${animal.id}`, animal);
-      farmStore.saveAnimal(res.data);
-      return res.data;
+      const res = await apiClient.put(`/animals/${animal.id}`, animal);
+      const updated = (res.data?.data || res.data) as Animal;
+      farmStore.saveAnimal(updated);
+      return updated;
     } catch {
       farmStore.saveAnimal(animal);
       return animal;
@@ -63,11 +315,17 @@ export const animalsApi = {
   },
 };
 
+// ----------------------------------------------------
+// Milk Records API
+// ----------------------------------------------------
 export const milkRecordsApi = {
   getAll: async (): Promise<MilkRecord[]> => {
     try {
-      const res = await apiClient.get<MilkRecord[]>('/milk-records');
-      return res.data;
+      const res = await apiClient.get('/milk-records?limit=100');
+      const data = res.data?.data || res.data;
+      if (Array.isArray(data)) return data;
+      if (Array.isArray(data?.items)) return data.items;
+      return farmStore.getMilkRecords();
     } catch {
       return farmStore.getMilkRecords();
     }
@@ -77,9 +335,13 @@ export const milkRecordsApi = {
     try {
       const res = await apiClient.post('/milk-records', record);
       farmStore.saveMilkRecord(record);
-      return res.data;
-    } catch {
-      return farmStore.saveMilkRecord(record);
+      return { success: true };
+    } catch (err: any) {
+      if (err.response?.status === 409) {
+        return { success: false, duplicate: true };
+      }
+      farmStore.saveMilkRecord(record);
+      return { success: true };
     }
   },
 
@@ -93,11 +355,17 @@ export const milkRecordsApi = {
   },
 };
 
+// ----------------------------------------------------
+// Expenses API
+// ----------------------------------------------------
 export const expensesApi = {
   getAll: async (): Promise<Expense[]> => {
     try {
-      const res = await apiClient.get<Expense[]>('/expenses');
-      return res.data;
+      const res = await apiClient.get('/expenses?limit=100');
+      const data = res.data?.data || res.data;
+      if (Array.isArray(data)) return data;
+      if (Array.isArray(data?.items)) return data.items;
+      return farmStore.getExpenses();
     } catch {
       return farmStore.getExpenses();
     }
@@ -105,9 +373,10 @@ export const expensesApi = {
 
   create: async (expense: Expense): Promise<Expense> => {
     try {
-      const res = await apiClient.post<Expense>('/expenses', expense);
-      farmStore.saveExpense(res.data);
-      return res.data;
+      const res = await apiClient.post('/expenses', expense);
+      const created = (res.data?.data || res.data) as Expense;
+      farmStore.saveExpense(created);
+      return created;
     } catch {
       farmStore.saveExpense(expense);
       return expense;
@@ -124,11 +393,17 @@ export const expensesApi = {
   },
 };
 
+// ----------------------------------------------------
+// Sales API
+// ----------------------------------------------------
 export const salesApi = {
   getAll: async (): Promise<Sale[]> => {
     try {
-      const res = await apiClient.get<Sale[]>('/sales');
-      return res.data;
+      const res = await apiClient.get('/sales?limit=100');
+      const data = res.data?.data || res.data;
+      if (Array.isArray(data)) return data;
+      if (Array.isArray(data?.items)) return data.items;
+      return farmStore.getSales();
     } catch {
       return farmStore.getSales();
     }
@@ -136,9 +411,10 @@ export const salesApi = {
 
   create: async (sale: Sale): Promise<Sale> => {
     try {
-      const res = await apiClient.post<Sale>('/sales', sale);
-      farmStore.saveSale(res.data);
-      return res.data;
+      const res = await apiClient.post('/sales', sale);
+      const created = (res.data?.data || res.data) as Sale;
+      farmStore.saveSale(created);
+      return created;
     } catch {
       farmStore.saveSale(sale);
       return sale;
@@ -155,28 +431,38 @@ export const salesApi = {
   },
 };
 
+// ----------------------------------------------------
+// Reports & Analytics API
+// ----------------------------------------------------
 export const reportsApi = {
   getStats: async (): Promise<DashboardStats> => {
     try {
-      const res = await apiClient.get<DashboardStats>('/reports');
-      return res.data;
+      const res = await apiClient.get('/reports');
+      const data = res.data?.data || res.data;
+      return (data as DashboardStats) || farmStore.getDashboardStats();
     } catch {
       return farmStore.getDashboardStats();
     }
   },
 };
 
+// ----------------------------------------------------
+// Bilingual AI Advisor API
+// ----------------------------------------------------
 export const aiAdvisorApi = {
   ask: async (query: string, language: 'en' | 'hi' = 'en'): Promise<{ answer: string; category: string }> => {
     try {
-      const res = await apiClient.post<{ answer: string; category: string }>('/ai-advisor', {
+      const res = await apiClient.post('/ai-advisor', {
         query,
         language,
         farmContext: farmStore.getDashboardStats(),
       });
-      return res.data;
-    } catch (err) {
-      // Fallback local intelligent generator
+      const data = res.data?.data || res.data;
+      return {
+        answer: data.answer,
+        category: data.category || 'general',
+      };
+    } catch {
       return {
         answer: generateLocalAIResponse(query, language),
         category: 'general',
@@ -185,7 +471,9 @@ export const aiAdvisorApi = {
   },
 };
 
+// ----------------------------------------------------
 // Fallback intelligent response generator for AI Advisor
+// ----------------------------------------------------
 export function generateLocalAIResponse(query: string, language: 'en' | 'hi'): string {
   const q = query.toLowerCase();
 
